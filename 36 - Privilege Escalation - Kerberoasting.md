@@ -1,0 +1,126 @@
+- We were able to initially get access to `dcorp-mgmt`, because `ciadmin` was a local administrator on it, from where on we were able to extract domain admin credentials, including the one for `svcadmin`, a DA, through whose account we were able to access the DC.
+- What could have been done if we were unable to extract any credentials from `dcorp-mgmt` in the first place? What are the other PrivEsc vectors available to us in an Active Directory environment?
+	- Let's take a look at Kerberoasting!
+
+#### Privilege Escalation - Kerberoasting
+- Kerberoasting is the offline cracking of service account passwords.
+- It is a very silent, but a very lethal attack!
+- The Kerberos session ticket (TGS) has a server portion which is encrypted with the password hash of a service account. This makes it possible to request a ticket and do offline password cracking.
+- Because (non-machine) service account passwords are not frequently changed, this has become a very popular attack!
+- ![[Pasted image 20250802021647.png]]
+- How does Kerberoasting work, and what makes it OPSEC friendly?
+	- When (3) we submitted a TGT, and request a TGS, the DC responds back with a TGS encrypted with the secret of the target service. The next step (4) we do is to request a Service Ticket, which is encrypted with the service account's NTLM hash.
+	- AES uses salting, so it is close to impossible to brute-force, so we would like a TGS that is encrypted with an NTLM hash (RC4).
+	- Once we get the NTLM hash encrypted TGS, we save it offline and try to brute-force it, we do not present it to the target service.
+	- We brute-force the TGS to get the clear-text password of the service account.
+	- Assuming the password is "abcd", in the brute-forcing process, we rotate through each clear-text credential present in the wordlist, NTLM hash it and see if it equates to the NTLM hash we have at hand. This is how offline brute-forcing works.
+	- Since the brute-force process is offline, there is no logging for wrong attempts, no lock-outs/rate-limiting, no sign of brute-forcing.
+	- Kerberoasting produces just one log entry on the DC, when we request the service ticket in step 3, a "4769" entry, but since requesting a ST is so common, a DC may have thousands of similar requests and subsequent logs in a day.
+		- Our computers even passively request tons of STs in the background in a day.
+	- If we have a good enough dictionary, we are in for a treat here.
+
+#### Performing a Kerberoast attack
+- What is the catch with Kerberoasting?
+	- User accounts may be susceptible to credential brute-forcing, but if we try to kerberoast a service that uses a machine account as a service account, it will have a secure password non-susceptible to brute-force attacks, and thus we will find it impossible to brute-force the password for it.
+	- Is it normal to have user accounts being used as service accounts in an AD environment?
+		- YES! It is a sin every organisations commit, but only some confess to. Organisations may want to fix the issue at hand, but who would want to take the responsibility if something goes wrong while making changes on production environment.
+		- In many organisations, we may even find service accounts with their passwords written down in clear-text in their description itself.
+		- MSAs (Managed Service Accounts) and GMSAs (Group Managed Service Accounts) were introduced, decades ago, specifically to mitigate issues like these.
+		- "Everything just works if you have DA privileges" mentality.
+	- The accounts we can target are user accounts that are treated as service accounts.
+		- User accounts are only treated as service accounts if they have a SPN (Service Principal Name) entry, with any non-null value. It doesn't even matter if there is an actual service running on that account or not.
+		- If an SPN exists for a user account, we can go to the DC and request a ST for it, and kerberoast it.
+- Finding user accounts used as service accounts:
+	- AD Module:
+		- `Get-ADUser -Filter {ServicePrincipalName -ne "$null"} -Properties ServicePrincipalName`
+	- PowerView:
+		- `Get-DomainUser -SPN`
+	- Rubeus:
+		- `Rubeus.exe kerberoast /stats`
+	- The recommended recon flow is Rubeus > PowerView:
+		- `Rubeus.exe kerberoast /stats`
+			- Rubeus provides us with the number of kerberoastable users (2), and their password last date.
+		- `Get-DomainUser -SPN`
+			- PowerView may also include the krbtgt account in the results, but it is a special account, even if we set the password for the krbtgt account manually, the password that it uses is machine-generated.
+			- `websvc` and `svcadmin` are two kerberoastable users that show up, the results would also include verbose details about the kerberoastable accounts.
+		- `svcadmin` appears to be set up for a MSSQL service that is running on `dcorp-mgmt`.
+			- Recall when we extracted credentials from `dcorp-mgmt`, we saw that the session there was listed as "service from 0", this is the service that we targeted, this means that on `dcorp-mgmt`, there is a MSSQL server running that uses `svcadmin`, one of the DAs as a service account.
+		- We can now request a service ticket for both `websvc` and `svcadmin`, and try to brute-force them offline to get the password for the accounts.
+- **The attack is very simple and easy to execute, but we need to have consideration put to OPSEC in this scenario.**
+	- Most people will just run Rubeus' kerberoast module and call it a day, but by doing so, they would be sending 10 service ticket requests (logged as 4769) to the DC in quick succession, which is an anomaly, and would trigger the MDI (and other detection tools) and lead to detection for the attack.
+		- **Do not do this:** `Rubeus.exe kerberoast`
+		- The recommended way to perform the attack is one user at a time (also read ahead for more OPSEC recommendations, don't just use this).
+			- `Rubeus.exe kerberoast /user:svcadmin /simple`
+	- This is no the only anomaly that can lead to detection, if we observe the authentication process, we would notice that we require a RC4 encrypted ticket here, we need the NTLM hash, because it can be brute-forced. This is a big chance for detection.
+		- We can list the encryption type for a ticket using Rubeus:
+			- `Rubeus.exe klist`
+				- `0x12` stands for AES-256.
+				- `0x17` stands for RC4-HMAC, which is what we need.
+		- We will observe that the ticket generated after Kerberoasting using Rubeus would have `0x17`/RC4-HMAC encryption type.
+		- The detection tool looks at it as us asking for a Service Ticket for a TGT, while also asking for it to not be encrypted securely.
+			- This is what may lead to the `Suspected Kerberos SPN Exposure` XDR alert.
+		- We can use Rubeus' `/rc4opsec` option, which simply tells Rubeus to not request a TGS if the target account does not support RC4.
+		- **But**, if we perform the attack without `/rc4opsec` on an account that only supports AES encryption, using Rubeus, we will see that we still get a NTLM hash back with an RC4 encrypted ticket, this is because Rubeus explicitly asks for a RC4 ticket for Kerberoasting.
+			- This also proves that the ultimate decision of the encryption used for the Service Ticket is made by the client, and that the KDC complies with the request made by the client.
+		- This makes Kerberoasting the only known bypass for the Protected Users Group:
+			- In case of the members of the Protected Users Group, Kerberos is not meant to use RC4, but even if a user belongs to the Protected Users Group, we can force the KDC to serve us a ST/TGS encrypted with RC4, by explicitly requesting for it while Kerberoasting using Rubeus.
+- Using Rubeus to perform the attack:
+	- ![[Pasted image 20250802052452.png]]
+	- The one command we should now explicitly settle on using with OPSEC consideration is the following:
+		- `Rubeus.exe kerberoast /user:svcadmin /simple /rc4opsec /outfile:C:\AD\Tools\hashes.txt`
+- Brute-force the ticket using John the Ripper:
+	- `C:\AD\Tools\john-1.9.0-jumbo-1-win64\run\john.exe --wordlist=C:\AD\Tools\kerberoast\10k-worst-pass.txt C:\AD\Tools\hashes.txt`
+		- This command will give us the error that no hashes have been loaded, this is because of something we may also face in production environments.
+			- If we look at the hashes, we will observe that the SPN includes a colon between the domain machine name and the port the service is running on, JtR (John the Ripper) uses the colon symbol for end of line, or end of code, all we need to do is to remove just the colon and the port number after it and re-run JtR.
+		- We can use tools like [crunch](https://github.com/jim3ma/crunch), [bopscrk](https://github.com/r3nt0n/bopscrk), [CeWl](https://github.com/digininja/CeWL) and more to generate custom wordlists.
+			- We can also include the current year and month in custom wordlists and custom wordlist generators, since they are prone to being used as password by some users, for example a password could be "January@2025".
+		- [SecLists](https://github.com/danielmiessler/SecLists) is a good collection of wordlists.
+
+#### Privilege Escalation - Targeted Kerberoasting - AS-REPs (AS-REP Roasting)
+- Rarely, a user's UAC settings may have "Do not require Kerberos pre-authentication" enable, i.e. Kerberos preauth may be disabled. In this case, it is possible to grab the user's crack-able AS-REP and brute-force it offline.
+- Kerberos preauth is something we may rarely find present in a target environment.
+- With sufficient rights (GenericWrite or GenericAll), Kerberos preauth can be disabled forcefully as well.
+	- What actually is Kerberos preauth?
+		- Kerberos preauth refers to the very first step of Kerberos Authentication: `1. A timestamp is encrypted with the secret (AES key or NTLM hash) of the user and sent to the KDC.`
+#### Performing Targeted Kerberoasting - AS-REPs
+![[Pasted image 20250803012022.png]]
+- Attack Steps:
+	- Go to the DC and request an encrypted blob from the DC, the blob is encrypted using the NTLM hash of the target user.
+	- Brute-force the blob offline for the clear-text password of the target user account.
+- Enumerating accounts with Kerberos Preauth disabled:
+	- Using PowerView:
+		- `Get-DomainUser -PreauthNotRequired -Verbose`
+	- Using AD Module:
+		- `Get-ADUser -Filter {DoesNotRequirePreAuth -eq $True} -Properties DoesNotRequirePreAuth`
+- Force disabling Kerberos Preauth:
+	- This can be done by making changes to the UAC settings and force disabling Kerberos Pre-authentication.
+	- We would need to enumerate the permissions for RDPUsers using PowerView (The Group student1, our foothold, is a part of):
+		- `Find-InterestingDomainAcl -ResolveGUIDs | ?{$_.IdentityReferenceName - match "RDPUsers"}`
+		- `Set-DomainObject -Identity Control1User -XOR @{useraccountcontrol=4194304} -Verbose`
+			- Force-disabling Kerberos Pre-authentication does not show up on the MDI.
+		- `Get-DomainUser -PreauthNotRequired -Verbose`
+- Performing AS-REP Roasting using Rubeus:
+	- Simply running `Rubeus.exe asreproast` would lead to Rubeus looking for accounts that can be AS-REP roasted, and requesting encrypted blobs for them. But of course, this would not be OPSEC safe!
+		- Running the above command would lead to detection by MDI with logs that read "Active Directory attributes Reconnaissance using LDAP", and "Suspected AS-REP Roasting attack", since here Rubeus is looking for the "DontRequirePreAuth" attribute, and since AS-REP Roasting is being performed on each user in quick succession (Requesting RC4-HMAC tickets in quick succession), respectively.
+		- To make this process more OPSEC friendly, we can perform the attack for each individual user at a time instead of trying to AS-REP roast multiple users in one go.
+	- Request encrypted AS-REP for offline brute-force:
+		- `C:\AD\Tools\Rubeus.exe asreproast /user:VPN1user /outfile:C:\AD\Tools\asrephashes.txt`
+	- Using JtR (John the Ripper) to brute-force the hashes offline:
+		- `john.exe --wordlist=C:\AD\Tools\kerberoast\10k-worst-pass.txt C:\AD\Tools\asrephashes.txt`
+
+#### Privilege Escalation - Targeted Kerberoasting - Set SPN
+- With enough rights (GenericAll/GenericWrite), we can either modify the PreAuth of the target user (by modifying the UAC settings), or set the SPN of the target user.
+	- The SPN can be set to anything, but it should be a unique value in the forest i.e. two accounts in the same forest cannot have the same SPN.
+	- The syntax for a SPN should be `servicename/machinename`, but there is not validation for this, so we can whatever we want as the machine name.
+- Which accounts can be Kerberoasted?
+	- Service accounts, which are accounts that have a non-null SPN.
+- If we have GenericAll or Generic Write on a user, we can add an SPN for it, and kerberoast it to get the clear text password for the account.
+- Why would we want to do that, when we can simply the reset the password for the user if we already have GenericAll/GenericWrite on it?
+	- Resetting the password of a user passes the scream test.
+		- When no one is ready to take ownership of a service or server, you pull the plug, and the first person to scream passes the screen test.
+	- The user we change the password for would most likely not be able to login, which would most definitely lead to detection. :-)
+- Setting a SPN for the user:
+	- Using PowerView:
+		- `Set-DomainObject -Identity support1user -Set @{serviceprincipalname='dcorp/whatever1'}
+	- Using AD Module:
+		- `Set-ADUser -Identity support1user -ServicePrincipalNames @{Add='dcorp/whatever1'}`

@@ -1,0 +1,18 @@
+- Enumerate the following for the `dollarcorp` domain:
+	- List all the OUs
+		- `Get-DomainOU | select -ExpandProperty name`
+		- `Domain Controllers` is a default OU, which is created by the system.
+	- List all the computers in the DevOps OU
+		- `Get-DomainOU -Identity DevOps).distinguishedname`
+		- This command just prints the distinguished name of the OU.
+		- `(Get-DomainOU -Identity DevOps).distinguishedname | %{Get-DomainComputer -SearchBase $_} | select name`
+		- This command pipes the distinguished name of the OU and initiates a loop to search computers with that name, and then pipes into select name which shows us the names of the resulting Computers.
+		- the `%{..}` block is an alias of `ForEach-Object`.
+	- List the GPOs
+		- `Get-DomainGPO`
+	- Enumerate GPO applied on the DevOps OU
+		- `(Get-DomainOU -Identity DevOps).gplink`
+		- `Get-DomainGPO -Identity '{GPO Name extracted from the details of the OU}'`
+		- Please note that we can not enumerate the settings that the GPO applies on the objects, we can just enumerate the details of the GPO.
+	- Enumerate ACLs for the Applocker and the DevOps GPOs
+		- We can use BloodHound for enumerating ACLs for the Applocker and DevOps GPOs, by looking at the inbound and outbound policy controls.

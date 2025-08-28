@@ -1,0 +1,21 @@
+- A GPO with an overly permissive ACL can be abused for multiple attacks.
+- Recall the ACL abuse diagram, and its Group policy section.
+- ![[Pasted image 20250605202213.png]]
+- We will not use the popular 'New Immediate Task' in the course, which is something which can be done with PowerView as well.
+- If we have an overly permissive ACL on a group policy, we are going to look at two attacks:
+	- Adding a user to the local Administrator group
+	- Modifying a group policy
+
+#### Privilege Escalation - GPO Abuse - GPOddity
+- GPOddity is a fairly recent attack, discussed by Synacktiv.
+- In GPOddity, we combine NTLM relaying with modification of Group Policy Container.
+- By relaying credentials of a user who has WriteDACL on a GPO, we can modify the path (gPCFileSysPath - which is the path of the policy that a GPO will load) of the group policy template (default is SYSVOL), to a path that we control.
+- We create a Group Policy that is malicious, which has a configuration intended to aid our motives, and then we modify a Group Policy making it point to the malicious template that we have.
+- This enables loading of a malicious template (GPT) from a location that we control.
+- ![[brave_screenshot_monikaalteredsecurity-my.sharepoint.com.png]]
+- Recall that in Learning Objective 1 we found that there is a share called AI on dcorp-ci, what we are going to do is to upload a malicious shortcut on the share, for relaying.
+- There is a user simulation on dcorp-ci that opens that LNK to trigger the authentication and relaying.
+- As soon as we get the credentials for the user simulation, we relay that to the DC to make modifications to the group policy.
+- What we will do here is simply adding a local administrator on dcorp-ci.
+- There are two parts to this attack, the first part is the relaying of the NTLM credentials, and the second part is the GPOddity part, where we modify the `gPCFileSysPath` (GPC File System Path) attribute so that the Group Policy now points to a malicious Group Policy template hosted by us on the SMB share.
+- Recall we saw that there is a user called `DEVOPSADMIN` that has WriteDACL permissions on `DEVOPS POLICY`, verifiable using BloodHound.

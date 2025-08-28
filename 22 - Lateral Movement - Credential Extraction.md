@@ -1,0 +1,50 @@
+- Local Security Authority (LSA) is responsible for authentication on Windows machines. Local Security Authority Subsystem Service (LSASS) is its service.
+- LSASS stores credentials in multiple forms - NT hash, AES, Kerberos tickets and so on.
+- Credentials are stored by LSASS when a user:
+	- Logs on to a local session or RDP
+	- Uses `RunAs` (`RunAs` is an executable used to start a process as a different user.)
+	- Runs a Windows service
+	- Runs a scheduled task or batch job
+	- Uses a Remote Administration tool
+- LSASS is a very attractive target for red teamers.
+- It is therefore the most actively monitored process on a Windows machine.
+- Some credentials that can be extracted without touching LSASS (to be OPSEC friendly) are:
+	- SAM hive (Registry) - Local credentials
+		- Dumping the SAM hive can be flagged by the EDR.
+		- Usually the command used to dump the hive is the culprit in terms of detection, not the process of interacting with it, for example, dumping using the reg command may have a higher chance of detection.
+	- LSA Secrets/SECURITY hive (Registry) - Service account passwords, Domain cached credentials etc.
+		- The one place we should always check for credentials.
+		- Not every EDR keeps an eye on the SECURITY hive.
+		- Dumping the SECURITY hive may or may not be flagged by the EDR.
+		- Usually the command used to dump the hive is the culprit in terms of detection, not the process of interacting with it, for example, dumping using the reg command may have a higher chance of detection.
+	- DPAPI Protected Credentials (Disk) - Credentials Manager/Vault, Browser Cookies, Certificates, Azure Tokens etc.
+		- Always look for DPAPI Protected credentials, this may even involve cloud or remote access credentials.
+		- "Browser is the new LSASS" holds true.
+		- For example, if we compromise a machine, we can try decrypting the chrome browser cookies on the machine to obtain credentials and access tokens.
+	- PowerShell Console History
+		- Syntax Highlighting in PowerShell is done by the module `Get-PSReadLine`, which is turned on by default.
+		- The `Get-PSReadLine` module logs all the commands that we have run in a clear-text file, that any administrator on the machine can read.
+		- This logged command history is reboot persistent in nature.
+		- Credential Objects are no longer logged in PowerShell Console History by `Get-PSReadLine`, but it is still a good idea to check PS Console history for credentials.
+	- System-wide Transcription (if enabled)
+		- System-wide Transcripts **may** allow anyone on the machine to see all the executed commands in clear-text.
+		- If the transcripts are saved in a directory like `C:\Transcripts`, a user may not even need admin access to view the system-wide transcripts, on the other hand if permissions are properly configured on the save directory, then only the administrator may be able to view the transcripts.
+		- Even if we are creating a `PSCredential` object, that is even if we are using clear-text credentials in PowerShell, they will be logged in the history in clear-text with no redaction.
+			- Example of `PSCredential` object creation:
+				- `$passwd = ConvertTo-SecureString "MySecretpass@123" -AsPlainText -Force`
+				- `$creds = New-Object System.Management.Automation.PSCredential ("dcorp\administrator",$passwd)`
+				- `Enter-PSSession -Credentials $creds -ComputerName dcorp-dc`
+		- Transcripts save not only the commands executed, but even the output of the commands executed.
+		- This logged command history is reboot persistent in nature.
+	- Script Block Logging (A note about)
+		- Script Block Logging is generally secure, and is the recommended method of logging commands instead of system-wide transcription or PS console history.
+
+#### A note on Red Teaming
+- Most red team operations are now considered to be just security engagements where the use of C2 frameworks is to be done, this is not right.
+- Things most red teamers checklist for an engagement:
+	- Usage of C2 Frameworks
+	- Extracting credentials from LSASS
+	- Escalating to domain admins
+	- EDR Bypass
+- All these things are necessary to a red team engagement, but are by no means the only things a red team engagement boils down to, there are many more tools and techniques to explore and tinker with.
+- Try to avoid being tool dependent as a red teamer.

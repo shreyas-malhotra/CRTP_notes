@@ -1,0 +1,129 @@
+![[Pasted image 20250331144228.png]]
+
+#### Domain Enumeration
+- For enumeration we can use the following tools:
+	- The ActiveDirectory PowerShell module (MS signed, and works even in PowerShell CLM)
+		- https://learn.microsoft.com/en-us/powershell/module/activedirectory/?view=windowsserver2022-ps
+		- https://github.com/samratashok/ADModule
+		- `Import-Module C:\AD\Tools\ADModule-master\Microsoft.ActiveDirectory.Management.dll`
+		- `Import-Module C:\AD\Tools\ADModule-master\ActiveDirectory\ActiveDirectory.psd1`
+	- BloodHound (C# and PowerShell Collectors)
+		- Both BloodHound CE and BloodHound Legacy, would be covered in the course
+		- https://github.com/BloodHoundAD/BloodHound
+	- PowerView (PowerShell)
+		- https://github.com/ZeroDayLab/PowerSploit/blob/master/Recon/PowerView.ps1
+		- `. C:\AD\Tools\PowerView.ps1`
+	- SharpView (C#) - Doesn't support filtering using Pipeline
+		- https://github.com/tevora-threat/SharpView/
+
+#### Domain Enumeration Steps
+- Note: All the commands I have specified are for `PowerView`, we have the same functionality using the AD-module as well, the commands for which can be referenced from the Lab Manual/Slides etc. (will maybe add those later.)
+- If we gain an initial foothold on a domain joined machine, by compromising a user using a phishing attack, or for cyber-criminals by purchasing access via brought credentials, or whatsoever the case may be, it may not always be access via RDP, as it is the course, for the student's convenience.
+- Our first step for domain enumeration would be starting a PowerShell session using `Invisi-Shell`.
+	- `C:\AD\Tools\InvisiShell\RunWithRegistryNonAdmin.bat`
+	- Using Invi-Shell we would be able to bypass PowerShell detection mechanisms like AMSI, System-wide Transcription, and Script Block Logging.
+- Next, we can load PowerView, using dot sourcing, this would enable us to use PowerView commands in our session.
+	- `. C:\AD\Tools\PowerView.ps1`
+- We can get information about the current domain, using the following command:
+	- `Get-Domain`
+	- The Name field informs us of the domain that we are joined to, along with the parent forest the domain belongs to in the format `<domain name>.<parent forest name>`.
+	- The Parent field informs us of the parent forest of the domain we are attached to.
+	- The DomainControllers field informs us of the Domain Controllers present on the domain, in the format `<domain controller name>.<domain name>.<parent forest name>`
+- Each domain has a Security Identifier (SID), that would be used later to forge tickets, we can get the SID using the following command:
+	- `Get-DomainSID`
+- We can get some information from the forest root as well, because there is a trust relationship between the domain and the parent forest. (Trust relationships would be discussed later on in the course.)
+	- `Get-Domain -Domain <parent forest name>`
+	- The command above will inform us of:
+		- The Forest name
+		- The DomainControllers present on the forest
+		- The children domains of the forest
+		- And more information the relevancy of which will be explained further if it is covered in the course.
+- We can also get information about the domain policies for the current domain, which may include policies like the password policy, the kerberos policy and more.
+	- `Get-Domain-PolicyData`
+	- The password policy would be listed under the SystemAccess field.
+	- The KerberosPolicy would be listed under the Kerberos Policy field.
+		- Why are we interested in Kerberos Policy?
+		- When we are forging tickets, the tool Rubeus actually takes care of all of this for us, but we should still know about the specified Kerberos policy for the domain.
+		- For example, when we use mimikatz to forge a diamond, golden or silver ticket, the default ticket expiry time, and the default ticket renewal period used by mimikatz is 10 years each.
+		- If we are forging tickets manually, without using Rubeus, using tools like SafetyKatz or mimikatz, we need to make sure that our tickets are compatible with the Kerberos Policy present on the target domain, for them to evade outright detection.
+		- By default, a ticket would have an age (or expiry) time of 10 hours and would be renewable upto 7 days.
+- We can get information about the domain controllers for the current domain using the following command
+	- `Get-DomainController`
+- We can get information about the domain controllers for another domains using the following command
+	- `Get-DomainController -Domain <domain name>`
+- Get a list of users in the current domain (includes all the non-null properties as well)
+	- `Get-DomainUser`
+- Get a list of users in the current domain (with specific properties like `samaccountname` or `logonCount`)
+	- `Get-DomainUser | select samaccountname`
+	- `Get-DomainUser | select samaccountname,logonCount` or `Get-DomainUser -Properties samaccountname,logonCount`
+		- The `logonCount` can be an important parameter to check during user enumeration because a lower or null `logonCount` value could point to an account being a decoy account or dormant account, attacking which may lead to immediate detection by defensive tools.
+		- A low-hanging fruit (for example kerberoastable) domain admin might be a setup or decoy to facilitate detection.
+		- Always perform attacks using active user accounts to avoid detection.
+- Get information about a specific domain user
+	- `Get-DomainUser -Identity student1`
+	- `Get-DomainUser -Identity student1 -Properties *`
+- Search for a particular string in a user's attributes
+	- `Get-DomainUser -LDAPFilter "Description=*built*" | Select name,Description`
+		- We are interested in checking out the Description field because still in 2025, some admins store clear-text credentials or critical information in the Description field, not knowing that it is visible to every Domain User.
+- Listing computers in the current domain
+	- `Get-DomainComputer | select Name`
+	- `Get-DomainComputer | select dnshostname`
+		- By default a domain user can add up to 10 computers to the domain, i.e. they can create 10 domain objects.
+		- So it can always be the case that some of these were simply created and left unused or are orphaned users, an easy to figure this out would be to again just check the `logonCount`, a computer with 0 logons would be a dormant object.
+		- `Get-DomainComputer | select dnshostname,logonCount`
+		- The `logoncount` resets after it reaches a value of 65,535.
+	- `Get-DomainComputer -OperatingSystem "*Server 2022*"`
+	- `Get-DomainComputer -Ping`
+- Group enumeration
+	- `Get-DomainGroup`
+	- `Get-DomainGroup -Domain <targetdomain>`
+	- `Get-DomainGroup | select Name`
+	- `Get-DomainGroup *admin* | select name`
+		- The Enterprise Admins group is missing from the list, because it is present in the Forest root, not in the child domain we are currently in, we can find it in the groups for the forest, `moneycorp.local`.
+		- `Get-DomainGroup *admin* -Domain moneycorp.local | select name`
+	- Get all the members of the `Domain Admins` group
+		- `Get-DomainGroupMember -Identity "Domain Admins" -Recurse`
+			- The `MemberSID` field shows the SID value as `SID Value`-`RID Value`, The SID has been enumerated by us earlier.
+			- RID is a unique identifier and there cannot be two objects with the same RID.
+			- RIDs from 500-1000 are reserved by the system.
+			- We can see two Domain Admins, one of which is the built-in Administrator, identifiable by its well-known RID of 500.
+			- Renaming the built-in Administrator provides no obscurity since it can always be identified by its RID value of 500.
+			- There is also a user-created Domain Admin `svcadmin`, which has a RID value greater than 1000.
+		- Organizations generally have many Domain Admins, increasing the attack surface significantly.
+		- If there are any tools that are deployed with the Domain Administrator role, they can be used for privilege escalation.
+		- Domain Admins are generally the most monitored and as such if OPSEC is a consideration, should not be attacked directly.
+	- Get the group membership for a user
+		- `Get-DomainGroup -UserName "student1"`
+- Local Group Enumeration
+	- List all the local groups on a machine (needs admin privileges on non-DC machines)
+		- `Get-NetLocalGroup -ComputerName dcorp-dc`
+	- List the members of the local group "Administrators" on a machine (needs admin privileges on non-DC machines)
+		- `Get-NetLocalGroupMember -ComputerName dcorp-dc -GroupName Administrators`
+		- On a domain controller, the "local" Administrators group is actually the Domain Admins group + any other members that may have been added.
+- Enumerate logged on users on a computer
+	- The process of enumerating logged on users is very noisy and leaves a logon, a special logon and a logoff log on the member machine.
+	- Get actively logged users on a computer (needs local admin privileges)
+		- `Get-NetLoggedon -ComputerName dcorp-adminsrv`
+	- Get locally logged users on a computer (needs remote registry on the target - started by-default on server OS)
+		- `Get-LoggedonLocal -ComputerName dcorp-adminsrv`
+	- Get the last logged user on a computer (needs administrative rights and remote registry on the target)
+		- `Get-LastLoggedOn -ComputerName dcorp-adminsrv`
+- Enumerate shares on hosts in current domain
+	- The better method to enumerate shares is to use **[PowerHuntShares](https://github.com/NetSPI/PowerHuntShares)**.
+		- The tool is powerful but noisy, since whenever we run a tool that interacts with all or many of the machines in a domain it leaves behind a lot of logon (4624) and logoff (4634) logs, doing that on a large number of machines, in rapid succession may lead to detection.
+		- It can discover shares, sensitive files, ACLs for shares, networks, computers, identities etc. and generate an HTML report.
+			- `Get-DomainComputer | select -ExpandProperty dnshostname`
+			- Since the first machine in a domain is always going to be the DC, and since we want to avoid SMB enumeration on the DCs, we will avoid it and store all the other machines in a new file called `servers.txt`.
+			- `Import-Module C:\AD\Tools\PowerHuntShares.psm1`
+			- `Invoke-HuntSMBShares -NoPing -OutputDirectory C:\AD\Tools -HostList C:\AD\Tools\servers.txt`
+			- Some errors pertaining to `Property "OperatingSystem" cannot be found` are expected while running the tool.
+			- The tool will generate a report, which we can have a look at to analyse the information in a better way, the lab environment does not have internet access, and if we want to see the report, we need to export it to our host machine since it fetches some information and images from the internet.
+			- We have a dashboard along with multiple functionalities like a ShareGraph that we can review.
+	- `Invoke-ShareFinder -Verbose`
+- Enumerate sensitive files on computers in the domain
+	- `Invoke-FileFinder -Verbose`
+- Get all fileservers of the domain
+	- `Get-NetFileServer`
+
+##### If a child domain is compromised, should we consider the parent domains compromised as well?
+- Privilege escalation on Domain Controllers can be done with as less as a single command, so if a Domain Controller is compromised, we can consider the whole forest to be in a compromised state.

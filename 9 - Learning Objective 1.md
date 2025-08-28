@@ -1,0 +1,15 @@
+- Enumerate following for the dollarcorp domain:
+	- Users
+	- Computers
+	- Domain Administrators
+	- Enterprise Administrators
+- Use BloodHound to identify the shortest path to Domain Admins in the dollarcorp domain.
+- Find a file share where our attacker machine (StudentX) has Write permissions.
+	- `Get-DomainComputer | select -ExpandProperty dnshostname`
+	- Since the first machine in a domain is always going to be the DC, and since we want to avoid SMB enumeration on the DCs, we will avoid it and store all the other machines in a new file called `servers.txt`.
+	- `Import-Module C:\AD\Tools\PowerHuntShares.psm1`
+	- `Invoke-HuntSMBShares -NoPing -OutputDirectory C:\AD\Tools -HostList C:\AD\Tools\servers.txt`
+	- Some errors pertaining to `Property "OperatingSystem" cannot be found` are expected while running the tool.
+	- The tool will generate a report, which we can have a look at to analyse the information in a better way, the lab environment does not have internet access, and if we want to see the report, we need to export it to our host machine since it fetches some information and images from the internet.
+	- We have a dashboard along with multiple functionalities like a ShareGraph that we can review.
+	- We found two shares where everyone has access, called `\\dcorp-std2.dollarcorp.moneycorp.local\studentshare2`, and `\\dcorp-ci.dollarcorp.moneycorp.local\AI` respectively.

@@ -1,0 +1,17 @@
+- Enumerate all domains in the `moneycorp.local` forest.
+	- `Get-ForestDomain -Verbose`
+- Map the trusts of the `dollarcorp.moneycorp.local` domain.
+	- `Get-DomainTrust`
+- Map External trusts in `moneycorp.local` forest.
+	- `Get-DomainTrust | ?{$_.TrustAttributes -eq "FILTER_SIDS"}`
+		- We can use this command since the `TrustAttributes` field value for external trusts is `FILTER_SIDS`.
+- Identify external trusts of `dollarcorp` domain. Can you enumerate trusts for a trusting forest?
+	- `Get-ForestDomain -Forest eurocorp.local`
+		- `eurocorp.local` has two Forest domains, `eurocorp.local` and `eu.eurocorp.local`.
+	- `Get-ForestDomain -Forest eurocorp.local | %{Get-DomainTrust -Domain $_.Name}`
+		- Here we can observe that our one-liner was able to successfully enumerate the trusts of `eurocorp.local` but fails to return the results with the trusts for `eu.eurocorp.local`.
+		- This is because external trusts are NOT transitive in nature.
+	- `Get-DomainUser -Domain eurocorp.local`
+		- We can enumerate tons of data from the `eurocorp.local` domain, we can even set up collectors and build a BloodHound database, but we cannot directly request data from `eu.eurocorp.local`.
+	- How would we then be able to go to `eu.eurocorp.local`?
+		- By extracting valid credentials of a user from `eurocorp.local`, and accessing `eu.eurocorp.local` using them, we can then reach the `eu.eurocorp.local` domain.

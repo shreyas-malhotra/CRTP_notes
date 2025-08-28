@@ -1,0 +1,1 @@
+- Note to self: choose the EU region for the lab.

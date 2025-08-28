@@ -1,0 +1,4 @@
+- ACL Mindmap
+	- ![[Pasted image 20250827025754.png]]
+- Attack Paths
+	- ![[Pasted image 20250827025825.png]]
